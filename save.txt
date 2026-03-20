@@ -1,0 +1,672 @@
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+import requests
+import os
+import time
+from datetime import datetime
+from skimage.exposure import match_histograms
+
+from binary_path_img import (
+    get_next_filename,
+    add_new_row_to_csv
+)
+
+DEBUG = True
+
+
+def log(*msg):
+    if DEBUG:
+        print(*msg)
+
+
+# =========================
+# OBJECT DETECTION
+# =========================
+
+def detection(image_path):
+
+    log("\n==============================")
+    log("STEP 1 : OBJECT DETECTION")
+    log("==============================")
+
+    model_name = "indicator-j3riv"
+    version = 4
+    api_key = "6GfuPFK2Ue4Fvh9EZiQJ"
+
+    api_url = f"https://detect.roboflow.com/{model_name}/{version}?api_key={api_key}&format=json"
+
+    with open(image_path, "rb") as image_file:
+        response = requests.post(api_url, files={"file": image_file})
+
+    image = cv2.imread(image_path)
+
+    if response.status_code != 200:
+        log("Detection API ERROR -> using original image")
+        return image
+
+    data = response.json()
+
+    if "predictions" not in data or len(data["predictions"]) == 0:
+        log("No object detected -> using full image")
+        return image
+
+    best_obj = max(data["predictions"], key=lambda x: x["confidence"])
+
+    x, y, w, h = int(best_obj["x"]), int(best_obj["y"]), int(best_obj["width"]), int(best_obj["height"])
+
+    x1, y1 = max(0, x - w // 2), max(0, y - h // 2)
+    x2, y2 = min(image.shape[1], x + w // 2), min(image.shape[0], y + h // 2)
+
+    cropped = image[y1:y2, x1:x2]
+
+    log("Detected object size:", cropped.shape)
+
+    return cropped
+
+
+# =========================
+# COLOR TRANSFER
+# =========================
+
+def color_transfer(source, target):
+
+    source = cv2.cvtColor(source, cv2.COLOR_BGR2LAB).astype("float32")
+    target = cv2.cvtColor(target, cv2.COLOR_BGR2LAB).astype("float32")
+
+    lMeanSrc, aMeanSrc, bMeanSrc = cv2.mean(source)[:3]
+    lMeanTar, aMeanTar, bMeanTar = cv2.mean(target)[:3]
+
+    lStdSrc, aStdSrc, bStdSrc = source.std(axis=(0,1))
+    lStdTar, aStdTar, bStdTar = target.std(axis=(0,1))
+
+    (l,a,b) = cv2.split(target)
+
+    l = ((l - lMeanTar) * (lStdSrc / (lStdTar + 1e-6))) + lMeanSrc
+    a = ((a - aMeanTar) * (aStdSrc / (aStdTar + 1e-6))) + aMeanSrc
+    b = ((b - bMeanTar) * (bStdSrc / (bStdTar + 1e-6))) + bMeanSrc
+
+    transfer = cv2.merge([l,a,b])
+    transfer = np.clip(transfer,0,255).astype("uint8")
+
+    return cv2.cvtColor(transfer, cv2.COLOR_LAB2BGR)
+
+
+# =========================
+# COLOR DIFFERENCE
+# =========================
+
+def color_difference(ref,img):
+
+    ref_lab = cv2.cvtColor(ref, cv2.COLOR_BGR2LAB)
+    img_lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+
+    return np.mean(np.abs(ref_lab.astype(float) - img_lab.astype(float)))
+
+
+# =========================
+# ITERATIVE COLOR MATCH
+# =========================
+
+def iterative_color_match(reference,target,max_iter=10,tolerance=0.5):
+
+    log("\nSTEP 2 : ITERATIVE COLOR MATCH")
+
+    history=[]
+    current=target.copy()
+    prev_diff=999999
+
+    for i in range(max_iter):
+
+        log(f"\nIteration {i+1}")
+
+        transfer=color_transfer(reference,current)
+
+        matched=match_histograms(
+            transfer,
+            reference,
+            channel_axis=-1
+        ).astype(np.uint8)
+
+        diff=color_difference(reference,matched)
+
+        history.append(diff)
+
+        log("Color diff:",diff)
+
+        improvement=prev_diff-diff
+
+        if abs(improvement)<tolerance:
+            log("Converged")
+            return matched,history
+
+        prev_diff=diff
+        current=matched
+
+    return current,history
+
+
+# =========================
+# APPLY COLOR TO FULL IMAGE
+# =========================
+
+def apply_color_to_full_image(reference,target,full_img):
+
+    ref_lab=cv2.cvtColor(reference,cv2.COLOR_BGR2LAB).astype("float32")
+    tar_lab=cv2.cvtColor(target,cv2.COLOR_BGR2LAB).astype("float32")
+
+    lMeanSrc,aMeanSrc,bMeanSrc=cv2.mean(ref_lab)[:3]
+    lMeanTar,aMeanTar,bMeanTar=cv2.mean(tar_lab)[:3]
+
+    lStdSrc,aStdSrc,bStdSrc=ref_lab.std(axis=(0,1))
+    lStdTar,aStdTar,bStdTar=tar_lab.std(axis=(0,1))
+
+    full_lab=cv2.cvtColor(full_img,cv2.COLOR_BGR2LAB).astype("float32")
+
+    l,a,b=cv2.split(full_lab)
+
+    l=((l-lMeanTar)*(lStdSrc/(lStdTar+1e-6)))+lMeanSrc
+    a=((a-aMeanTar)*(aStdSrc/(aStdTar+1e-6)))+aMeanSrc
+    b=((b-bMeanTar)*(bStdSrc/(bStdTar+1e-6)))+bMeanSrc
+
+    merged=cv2.merge([l,a,b])
+    merged=np.clip(merged,0,255).astype("uint8")
+
+    return cv2.cvtColor(merged,cv2.COLOR_LAB2BGR)
+
+
+# =========================
+# MAIN PROCESS
+# =========================
+
+def processing_img(refpath,targetpath,filename_path):
+
+    start=time.time()
+
+    reference_img=cv2.imread(refpath)
+    target_img=cv2.imread(targetpath)
+
+    cropped=detection(targetpath)
+
+    cropped=cv2.resize(
+        cropped,
+        (reference_img.shape[1],reference_img.shape[0])
+    )
+
+    diff_before=color_difference(reference_img,cropped)
+
+    log("Initial diff:",diff_before)
+
+    result_img,history=iterative_color_match(reference_img,cropped)
+
+    diff_after=color_difference(reference_img,result_img)
+
+    log("Final diff:",diff_after)
+
+    # apply to full image
+    full_corrected=apply_color_to_full_image(
+        reference_img,
+        cropped,
+        target_img
+    )
+
+    # visualization
+    reference_rgb=cv2.cvtColor(reference_img,cv2.COLOR_BGR2RGB)
+    target_rgb=cv2.cvtColor(target_img,cv2.COLOR_BGR2RGB)
+    cropped_rgb=cv2.cvtColor(cropped,cv2.COLOR_BGR2RGB)
+    result_rgb=cv2.cvtColor(result_img,cv2.COLOR_BGR2RGB)
+    full_rgb=cv2.cvtColor(full_corrected,cv2.COLOR_BGR2RGB)
+
+    fig,axes=plt.subplots(2,3,figsize=(18,10))
+
+    axes[0,0].imshow(reference_rgb)
+    axes[0,0].set_title("Reference")
+
+    axes[0,1].imshow(target_rgb)
+    axes[0,1].set_title("Target")
+
+    axes[0,2].imshow(cropped_rgb)
+    axes[0,2].set_title("Detected Object")
+
+    axes[1,0].imshow(result_rgb)
+    axes[1,0].set_title("Object Corrected")
+
+    axes[1,1].imshow(full_rgb)
+    axes[1,1].set_title("Full Image Corrected")
+
+    axes[1,2].plot(history)
+    axes[1,2].set_title("Color Diff Iteration")
+
+    for ax in axes.flatten():
+        ax.axis("off")
+
+    os.makedirs("static/results",exist_ok=True)
+
+    object_path=f"static/results/{filename_path}_object.jpg"
+    full_path=f"static/results/{filename_path}_full.jpg"
+    plot_path=f"static/results/{filename_path}_plot.jpg"
+
+    cv2.imwrite(object_path,result_img)
+    cv2.imwrite(full_path,full_corrected)
+
+    plt.tight_layout()
+    plt.savefig(plot_path,dpi=300)
+
+    end=time.time()
+
+    log("Processing time:",end-start)
+
+    return object_path,full_path,plot_path
+
+
+# =========================
+# PIPELINE
+# =========================
+
+def run_image_processing_pipeline(reference_path,uploaded_file,csv_file="image_log.csv"):
+
+    log("\nNEW IMAGE PROCESSING")
+
+    UPLOAD_FOLDER='static/uploads/'
+    os.makedirs(UPLOAD_FOLDER,exist_ok=True)
+
+    next_filename=get_next_filename(csv_file)
+    new_filename=str(next_filename)
+
+    new_time=datetime.now().strftime("%H:%M:%S")
+    new_day=datetime.now().strftime("%d-%m-%Y")
+
+    add_new_row_to_csv(csv_file,new_filename,new_time,new_day)
+
+    target_path=os.path.join(UPLOAD_FOLDER,f"{new_filename}.jpg")
+
+    uploaded_file.save(target_path)
+
+    object_path,full_path,plot_path=processing_img(
+        reference_path,
+        target_path,
+        filename_path=new_filename
+    )
+
+    return{
+        "object_result":object_path,
+        "full_result":full_path,
+        "plot":plot_path,
+        "filename":new_filename
+    }
+
+
+
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+import requests
+import os
+import time
+from datetime import datetime
+from skimage.exposure import match_histograms
+from skimage.color import deltaE_ciede2000
+
+from binary_path_img import (
+    get_next_filename,
+    add_new_row_to_csv
+)
+
+DEBUG = True
+
+
+def log(*msg):
+    if DEBUG:
+        print(*msg)
+
+
+# =========================
+# OBJECT DETECTION
+# =========================
+
+def detection(image_path):
+
+    log("\n==============================")
+    log("STEP 1 : OBJECT DETECTION")
+    log("==============================")
+
+    model_name = "indicator-j3riv"
+    version = 4
+    api_key = "6GfuPFK2Ue4Fvh9EZiQJ"
+
+    api_url = f"https://detect.roboflow.com/{model_name}/{version}?api_key={api_key}&format=json"
+
+    with open(image_path, "rb") as image_file:
+        response = requests.post(api_url, files={"file": image_file})
+
+    image = cv2.imread(image_path)
+
+    if response.status_code != 200:
+        log("Detection API ERROR -> using original image")
+        return image
+
+    data = response.json()
+
+    if "predictions" not in data or len(data["predictions"]) == 0:
+        log("No object detected -> using full image")
+        return image
+
+    best_obj = max(data["predictions"], key=lambda x: x["confidence"])
+
+    x, y, w, h = int(best_obj["x"]), int(best_obj["y"]), int(best_obj["width"]), int(best_obj["height"])
+
+    x1, y1 = max(0, x - w // 2), max(0, y - h // 2)
+    x2, y2 = min(image.shape[1], x + w // 2), min(image.shape[0], y + h // 2)
+    pad = int(0.03 * max(w, h))
+
+    x1 = max(0, x1 - pad)
+    y1 = max(0, y1 - pad)
+    x2 = min(image.shape[1], x2 + pad)
+    y2 = min(image.shape[0], y2 + pad)
+
+    cropped = image[y1:y2, x1:x2]
+
+    log("Detected object size:", cropped.shape)
+
+    return cropped
+
+
+# =========================
+# COLOR TRANSFER
+# =========================
+
+def color_transfer(source, target):
+
+    source = cv2.cvtColor(source, cv2.COLOR_BGR2LAB).astype("float32")
+    target = cv2.cvtColor(target, cv2.COLOR_BGR2LAB).astype("float32")
+
+    lMeanSrc, aMeanSrc, bMeanSrc = cv2.mean(source)[:3]
+    lMeanTar, aMeanTar, bMeanTar = cv2.mean(target)[:3]
+
+    lStdSrc, aStdSrc, bStdSrc = source.std(axis=(0,1))
+    lStdTar, aStdTar, bStdTar = target.std(axis=(0,1))
+
+    (l,a,b) = cv2.split(target)
+
+    l = ((l - lMeanTar) * (lStdSrc / (lStdTar + 1e-6))) + lMeanSrc
+    a = ((a - aMeanTar) * (aStdSrc / (aStdTar + 1e-6))) + aMeanSrc
+    b = ((b - bMeanTar) * (bStdSrc / (bStdTar + 1e-6))) + bMeanSrc
+
+    transfer = cv2.merge([l,a,b])
+    transfer = np.clip(transfer,0,255).astype("uint8")
+
+    return cv2.cvtColor(transfer, cv2.COLOR_LAB2BGR)
+
+def orange_region_boost(img, strength=1.2):
+
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+
+    lower_orange = np.array([5, 100, 100])
+    upper_orange = np.array([20, 255, 255])
+
+    mask = cv2.inRange(hsv, lower_orange, upper_orange)
+
+    # เพิ่ม saturation เฉพาะสีส้ม
+    hsv[:,:,1] = np.where(mask>0, hsv[:,:,1]*strength, hsv[:,:,1])
+    hsv[:,:,1] = np.clip(hsv[:,:,1], 0, 255)
+
+    return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+
+def analyze_rgb_and_orange_shift(ref, img):
+
+    ref_rgb = cv2.cvtColor(ref, cv2.COLOR_BGR2RGB)
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    # mean RGB
+    ref_mean = ref_rgb.mean(axis=(0,1))
+    img_mean = img_rgb.mean(axis=(0,1))
+
+    diff_rgb = img_mean - ref_mean
+
+    # =========================
+    # ORANGE MASK (HSV)
+    # =========================
+    ref_hsv = cv2.cvtColor(ref, cv2.COLOR_BGR2HSV)
+    img_hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+
+    # ช่วงสีส้ม (ปรับได้)
+    lower_orange = np.array([5, 100, 100])
+    upper_orange = np.array([20, 255, 255])
+
+    ref_mask = cv2.inRange(ref_hsv, lower_orange, upper_orange)
+    img_mask = cv2.inRange(img_hsv, lower_orange, upper_orange)
+
+    ref_orange_ratio = np.sum(ref_mask > 0) / ref_mask.size
+    img_orange_ratio = np.sum(img_mask > 0) / img_mask.size
+
+    orange_shift = img_orange_ratio - ref_orange_ratio
+
+    return {
+        "rgb_diff": diff_rgb,
+        "ref_orange_ratio": ref_orange_ratio,
+        "img_orange_ratio": img_orange_ratio,
+        "orange_shift": orange_shift
+    }
+
+# =========================
+# COLOR DIFFERENCE
+# =========================
+def advanced_color_match(reference, target):
+
+    # STEP 1: global transfer
+    step1 = color_transfer(reference, target)
+
+    # STEP 2: histogram
+    step2 = match_histograms(step1, reference, channel_axis=-1).astype(np.uint8)
+
+    # STEP 3: orange boost
+    step3 = orange_region_boost(step2, strength=1.15)
+
+    return step3
+
+def deltaE_cie2000(ref, img):
+    ref_lab = cv2.cvtColor(ref, cv2.COLOR_BGR2LAB)
+    img_lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    return np.mean(deltaE_ciede2000(ref_lab, img_lab))
+
+# =========================
+# ITERATIVE COLOR MATCH
+# =========================
+
+def iterative_color_match(reference, target, max_iter=10, tolerance=0.3):
+
+    log("\nSTEP 2 : ITERATIVE COLOR MATCH (PRO)")
+
+    history = []
+    orange_history = []
+
+    current = target.copy()
+    prev_diff = 999999
+
+    for i in range(max_iter):
+
+        log(f"\nIteration {i+1}")
+
+        # ใช้ advanced pipeline
+        matched = advanced_color_match(reference, current)
+
+        # ใช้ DeltaE (แม่นกว่า)
+        diff = deltaE_cie2000(reference, matched)
+
+        # วิเคราะห์สี
+        analysis = analyze_rgb_and_orange_shift(reference, matched)
+        orange_shift = abs(analysis["orange_shift"])
+
+        history.append(diff)
+        orange_history.append(orange_shift)
+
+        log("DeltaE:", diff)
+        log("Orange shift:", orange_shift)
+        log("RGB shift:", analysis["rgb_diff"])
+
+        improvement = prev_diff - diff
+
+        # ✅ เงื่อนไขหยุดแบบฉลาด
+        if abs(improvement) < tolerance and orange_shift < 0.01:
+            log("Converged (color + orange stable)")
+            return matched, history, orange_history
+
+        prev_diff = diff
+        current = matched
+
+    return current, history, orange_history
+
+# =========================
+# APPLY COLOR TO FULL IMAGE
+# =========================
+
+def apply_color_to_full_image(reference,target,full_img):
+
+    ref_lab=cv2.cvtColor(reference,cv2.COLOR_BGR2LAB).astype("float32")
+    tar_lab=cv2.cvtColor(target,cv2.COLOR_BGR2LAB).astype("float32")
+
+    lMeanSrc,aMeanSrc,bMeanSrc=cv2.mean(ref_lab)[:3]
+    lMeanTar,aMeanTar,bMeanTar=cv2.mean(tar_lab)[:3]
+
+    lStdSrc,aStdSrc,bStdSrc=ref_lab.std(axis=(0,1))
+    lStdTar,aStdTar,bStdTar=tar_lab.std(axis=(0,1))
+
+    full_lab=cv2.cvtColor(full_img,cv2.COLOR_BGR2LAB).astype("float32")
+
+    l,a,b=cv2.split(full_lab)
+
+    l=((l-lMeanTar)*(lStdSrc/(lStdTar+1e-6)))+lMeanSrc
+    a=((a-aMeanTar)*(aStdSrc/(aStdTar+1e-6)))+aMeanSrc
+    b=((b-bMeanTar)*(bStdSrc/(bStdTar+1e-6)))+bMeanSrc
+
+    merged=cv2.merge([l,a,b])
+    merged=np.clip(merged,0,255).astype("uint8")
+
+    return cv2.cvtColor(merged,cv2.COLOR_LAB2BGR)
+
+
+# =========================
+# MAIN PROCESS
+# =========================
+
+def processing_img(refpath, targetpath, filename_path):
+
+    start = time.time()
+
+    reference_img = cv2.imread(refpath)
+    target_img = cv2.imread(targetpath)
+
+    cropped = detection(targetpath)
+
+    cropped = cv2.resize(
+        cropped,
+        (reference_img.shape[1], reference_img.shape[0])
+    )
+
+    # BEFORE
+    diff_before = deltaE_cie2000(reference_img, cropped)
+    log("Initial DeltaE:", diff_before)
+
+    # MATCH
+    result_img, history, orange_history = iterative_color_match(reference_img, cropped)
+
+    # AFTER
+    diff_after = deltaE_cie2000(reference_img, result_img)
+    log("Final DeltaE:", diff_after)
+
+    # ANALYSIS
+    analysis = analyze_rgb_and_orange_shift(reference_img, result_img)
+
+    # APPLY FULL IMAGE
+    full_corrected = apply_color_to_full_image(
+        reference_img,
+        cropped,
+        target_img
+    )
+
+    # =========================
+    # VISUALIZATION PRO
+    # =========================
+
+    reference_rgb = cv2.cvtColor(reference_img, cv2.COLOR_BGR2RGB)
+    target_rgb = cv2.cvtColor(target_img, cv2.COLOR_BGR2RGB)
+    cropped_rgb = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
+    result_rgb = cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB)
+    full_rgb = cv2.cvtColor(full_corrected, cv2.COLOR_BGR2RGB)
+
+    fig,axes=plt.subplots(2,3,figsize=(18,10))
+
+    axes[0,0].imshow(reference_rgb)
+    axes[0,0].set_title("Reference")
+
+    axes[0,1].imshow(target_rgb)
+    axes[0,1].set_title("Target")
+
+    axes[0,2].imshow(cropped_rgb)
+    axes[0,2].set_title("Detected Object")
+
+    axes[1,0].imshow(result_rgb)
+    axes[1,0].set_title("Object Corrected")
+
+    axes[1,1].imshow(full_rgb)
+    axes[1,1].set_title("Full Image Corrected")
+
+    axes[1,2].plot(history)
+    axes[1,2].set_title("Color Diff Iteration")
+
+    for ax in axes.flatten():
+        ax.axis("off")
+
+    os.makedirs("static/results",exist_ok=True)
+
+    object_path=f"static/results/{filename_path}_object.jpg"
+    full_path=f"static/results/{filename_path}_full.jpg"
+    plot_path=f"static/results/{filename_path}_plot.jpg"
+
+    cv2.imwrite(object_path,result_img)
+    cv2.imwrite(full_path,full_corrected)
+
+    plt.tight_layout()
+    plt.savefig(plot_path,dpi=300)
+
+    end=time.time()
+
+    log("Processing time:",end-start)
+
+    return object_path,full_path,plot_path
+
+# =========================
+# PIPELINE
+# =========================
+
+def run_image_processing_pipeline(reference_path,uploaded_file,csv_file="image_log.csv"):
+
+    log("\nNEW IMAGE PROCESSING")
+
+    UPLOAD_FOLDER='static/uploads/'
+    os.makedirs(UPLOAD_FOLDER,exist_ok=True)
+
+    next_filename=get_next_filename(csv_file)
+    new_filename=str(next_filename)
+
+    new_time=datetime.now().strftime("%H:%M:%S")
+    new_day=datetime.now().strftime("%d-%m-%Y")
+
+    add_new_row_to_csv(csv_file,new_filename,new_time,new_day)
+
+    target_path=os.path.join(UPLOAD_FOLDER,f"{new_filename}.jpg")
+
+    uploaded_file.save(target_path)
+
+    object_path,full_path,plot_path=processing_img(
+        reference_path,
+        target_path,
+        filename_path=new_filename
+    )
+
+    return{
+        "object_result":object_path,
+        "full_result":full_path,
+        "plot":plot_path,
+        "filename":new_filename
+    }
