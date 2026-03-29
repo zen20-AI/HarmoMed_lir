@@ -1,5 +1,5 @@
 import os
-from binary_HarmoMed_img import run_image_processing_pipeline
+from binary_HarmoMed_img_AI import run_image_processing_pipeline
 from werkzeug.datastructures import FileStorage
 
 # if __name__ == "__main__":
